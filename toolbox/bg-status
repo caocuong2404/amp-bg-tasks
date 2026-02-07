@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# bg-status - Check status of background tasks
+# Toolbox tool for Amp
+
+set -euo pipefail
+
+TASKS_DIR="${HOME}/.local/state/amp-bg-tasks"
+
+if [[ "${TOOLBOX_ACTION:-}" == "describe" ]]; then
+    cat <<'SCHEMA'
+{
+  "name": "bg_status",
+  "description": "Check the status of background tasks. Without a task_id, lists all tasks. With a task_id, shows detailed status of that specific task. Use this to monitor running processes started with bg_run.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "task_id": {
+        "type": "string",
+        "description": "Optional specific task ID to check. If omitted, lists all tasks."
+      }
+    }
+  }
+}
+SCHEMA
+    exit 0
+fi
+
+# Execute mode
+INPUT=$(cat)
+TASK_ID=$(echo "$INPUT" | jq -r '.task_id // empty')
+
+# Refresh status of running tasks
+refresh_task() {
+    local task_dir="$1"
+    local status
+    status=$(cat "$task_dir/status" 2>/dev/null || echo "unknown")
+    if [[ "$status" == "running" ]]; then
+        local pid
+        pid=$(cat "$task_dir/pid" 2>/dev/null || echo "0")
+        if [[ "$pid" != "0" ]] && ! kill -0 "$pid" 2>/dev/null; then
+            # Process ended but status wasn't updated (e.g. killed externally)
+            if [[ -f "$task_dir/exit_code" ]]; then
+                local ec
+                ec=$(cat "$task_dir/exit_code")
+                if [[ "$ec" -eq 0 ]]; then
+                    echo "completed" > "$task_dir/status"
+                else
+                    echo "failed" > "$task_dir/status"
+                fi
+            else
+                echo "137" > "$task_dir/exit_code"
+                echo "killed" > "$task_dir/status"
+            fi
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > "$task_dir/finished_at"
+        fi
+    fi
+}
+
+if [[ -n "$TASK_ID" ]]; then
+    # Show specific task
+    TASK_DIR="${TASKS_DIR}/${TASK_ID}"
+    if [[ ! -d "$TASK_DIR" ]]; then
+        echo "{\"error\": \"Task not found: $TASK_ID\"}"
+        exit 1
+    fi
+
+    refresh_task "$TASK_DIR"
+
+    STATUS=$(cat "$TASK_DIR/status" 2>/dev/null || echo "unknown")
+    COMMAND=$(cat "$TASK_DIR/command" 2>/dev/null || echo "")
+    LABEL=$(cat "$TASK_DIR/label" 2>/dev/null || echo "")
+    PID=$(cat "$TASK_DIR/pid" 2>/dev/null || echo "0")
+    STARTED=$(cat "$TASK_DIR/started_at" 2>/dev/null || echo "")
+    FINISHED=$(cat "$TASK_DIR/finished_at" 2>/dev/null || echo "")
+    EXIT_CODE=$(cat "$TASK_DIR/exit_code" 2>/dev/null || echo "")
+    CWD=$(cat "$TASK_DIR/cwd" 2>/dev/null || echo "")
+    STDOUT_LINES=$(wc -l < "$TASK_DIR/stdout" 2>/dev/null || echo "0")
+    STDERR_LINES=$(wc -l < "$TASK_DIR/stderr" 2>/dev/null || echo "0")
+
+    jq -n \
+        --arg id "$TASK_ID" \
+        --arg status "$STATUS" \
+        --arg command "$COMMAND" \
+        --arg label "$LABEL" \
+        --arg pid "$PID" \
+        --arg started "$STARTED" \
+        --arg finished "$FINISHED" \
+        --arg exit_code "$EXIT_CODE" \
+        --arg cwd "$CWD" \
+        --arg stdout_lines "$STDOUT_LINES" \
+        --arg stderr_lines "$STDERR_LINES" \
+        '{
+            task_id: $id,
+            status: $status,
+            label: $label,
+            command: $command,
+            pid: ($pid | tonumber),
+            cwd: $cwd,
+            started_at: $started,
+            finished_at: (if $finished != "" then $finished else null end),
+            exit_code: (if $exit_code != "" then ($exit_code | tonumber) else null end),
+            stdout_lines: ($stdout_lines | tonumber),
+            stderr_lines: ($stderr_lines | tonumber)
+        }'
+else
+    # List all tasks
+    if [[ ! -d "$TASKS_DIR" ]]; then
+        echo '{"tasks": [], "message": "No background tasks found."}'
+        exit 0
+    fi
+
+    TASKS="[]"
+    for task_dir in "$TASKS_DIR"/task-*; do
+        [[ -d "$task_dir" ]] || continue
+        refresh_task "$task_dir"
+
+        local_id=$(basename "$task_dir")
+        local_status=$(cat "$task_dir/status" 2>/dev/null || echo "unknown")
+        local_label=$(cat "$task_dir/label" 2>/dev/null || echo "")
+        local_command=$(cat "$task_dir/command" 2>/dev/null || echo "")
+        local_started=$(cat "$task_dir/started_at" 2>/dev/null || echo "")
+        local_pid=$(cat "$task_dir/pid" 2>/dev/null || echo "0")
+
+        TASKS=$(echo "$TASKS" | jq \
+            --arg id "$local_id" \
+            --arg status "$local_status" \
+            --arg label "$local_label" \
+            --arg command "$local_command" \
+            --arg started "$local_started" \
+            --arg pid "$local_pid" \
+            '. + [{
+                task_id: $id,
+                status: $status,
+                label: $label,
+                command: $command,
+                started_at: $started,
+                pid: ($pid | tonumber)
+            }]')
+    done
+
+    RUNNING=$(echo "$TASKS" | jq '[.[] | select(.status == "running")] | length')
+    TOTAL=$(echo "$TASKS" | jq 'length')
+
+    jq -n \
+        --argjson tasks "$TASKS" \
+        --argjson running "$RUNNING" \
+        --argjson total "$TOTAL" \
+        '{
+            tasks: $tasks,
+            summary: {total: $total, running: $running}
+        }'
+fi

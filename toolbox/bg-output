@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# bg-output - Smart log reader for background tasks
+# Auto-cleans output: strips ANSI, truncates long lines, collapses repeats
+# Supports filtering, incremental reads, and pattern exclusion
+
+set -euo pipefail
+
+TASKS_DIR="${HOME}/.local/state/amp-bg-tasks"
+
+if [[ "${TOOLBOX_ACTION:-}" == "describe" ]]; then
+    cat <<'SCHEMA'
+{
+  "name": "bg_output",
+  "description": "Smart log reader for background tasks. Output is ALWAYS auto-cleaned: ANSI codes stripped, long lines truncated to 150 chars, repetitive lines collapsed (e.g. '... 8 similar lines collapsed'). Use 'filter' to grep only errors/warnings, 'exclude' to hide noise, 'since' for incremental reads (only new lines since last check), 'tail' for last N lines. Default max_lines=80. IMPORTANT: For dev servers, ALWAYS use filter='error|Error|ERROR|warn|WARN|fail|FAIL|exception|Exception|panic|crash' to avoid context pollution.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "task_id": {
+        "type": "string",
+        "description": "The task ID returned by bg_run"
+      },
+      "stream": {
+        "type": "string",
+        "enum": ["stdout", "stderr", "both"],
+        "description": "Which output stream to read. Default: both"
+      },
+      "tail": {
+        "type": "integer",
+        "description": "Only return the last N lines. Use for quick checks."
+      },
+      "filter": {
+        "type": "string",
+        "description": "Regex — only return matching lines. ALWAYS use this for dev servers. Example: 'error|Error|ERROR|warn|WARN|fail|FAIL|Exception|panic'"
+      },
+      "exclude": {
+        "type": "string",
+        "description": "Regex — remove matching lines before filter. Example: 'GET 200|healthcheck|HMR|static|favicon|node_modules'"
+      },
+      "since": {
+        "type": "boolean",
+        "description": "Incremental mode — only new lines since last read. Tracks cursor per task. Use for polling running servers."
+      },
+      "max_lines": {
+        "type": "integer",
+        "description": "Max lines to return. Default: 80. Keep low to protect context."
+      },
+      "raw": {
+        "type": "boolean",
+        "description": "Disable all auto-cleaning (ANSI strip, line truncation, dedup). Default: false. Only use for debugging the tool itself."
+      }
+    },
+    "required": ["task_id"]
+  }
+}
+SCHEMA
+    exit 0
+fi
+
+# Execute mode
+INPUT=$(cat)
+TASK_ID=$(echo "$INPUT" | jq -r '.task_id // empty')
+STREAM=$(echo "$INPUT" | jq -r '.stream // "both"')
+TAIL=$(echo "$INPUT" | jq -r '.tail // empty')
+FILTER=$(echo "$INPUT" | jq -r '.filter // empty')
+EXCLUDE=$(echo "$INPUT" | jq -r '.exclude // empty')
+SINCE=$(echo "$INPUT" | jq -r '.since // false')
+MAX_LINES=$(echo "$INPUT" | jq -r '.max_lines // "80"')
+RAW=$(echo "$INPUT" | jq -r '.raw // false')
+
+if [[ -z "$TASK_ID" ]]; then
+    echo '{"error": "task_id is required"}'
+    exit 1
+fi
+
+TASK_DIR="${TASKS_DIR}/${TASK_ID}"
+if [[ ! -d "$TASK_DIR" ]]; then
+    echo "{\"error\": \"Task not found: $TASK_ID\"}"
+    exit 1
+fi
+
+STATUS=$(cat "$TASK_DIR/status" 2>/dev/null || echo "unknown")
+
+# ── Cleaning functions ──
+
+# Strip ANSI escape codes (both real \x1b[...m and literal [32m[39m forms)
+strip_ansi() {
+    sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b\]0;[^\x07]*\x07//g; s/\x1b\[[\?]?[0-9]*[a-z]//g; s/\[([0-9]{1,2}(;[0-9]{1,2})*)?m//g'
+}
+
+# Truncate lines longer than N chars
+truncate_lines() {
+    local max_len=150
+    awk -v maxlen="$max_len" '{
+        if (length($0) > maxlen) {
+            print substr($0, 1, maxlen) "...[truncated]"
+        } else {
+            print
+        }
+    }'
+}
+
+# Shorten node_modules/.pnpm paths: /long/node_modules/.pnpm/pkg@ver.../file → .pnpm/pkg@.../file
+shorten_paths() {
+    sed -E 's|[^ ]*/node_modules/\.pnpm/([^/]{1,30})[^/]*/node_modules/([^/ ]+)|.pnpm/\1.../\2|g; s|[^ ]*/node_modules/([^/ ]+)|node_modules/\1|g'
+}
+
+# Collapse consecutive similar/repetitive lines
+collapse_repeats() {
+    awk '
+    function make_sig(line) {
+        s = line
+        # Strip leading whitespace and log-level prefixes
+        gsub(/^[[:space:]]+/, "", s)
+        gsub(/^(info|warn|error|debug|INFO|WARN|ERROR|DEBUG):?[[:space:]]+/, "", s)
+        gsub(/^[0-9T:.Z\/ -]+/, "", s)
+        # Normalize: collapse variable parts (flags, paths, versions) to get a pattern
+        gsub(/MEDUSA_FF_[A-Z_]+/, "MEDUSA_FF_*", s)
+        gsub(/[0-9]+\.[0-9]+\.[0-9]+/, "*", s)
+        gsub(/node_modules\/[^ ]+/, "node_modules/...", s)
+        gsub(/\.pnpm\/[^ ]+/, ".pnpm/...", s)
+        # Use first 50 chars of normalized pattern as signature
+        return substr(s, 1, 50)
+    }
+    {
+        sig = make_sig($0)
+    }
+    sig == prev_sig {
+        count++
+        next
+    }
+    {
+        if (count > 0) {
+            printf "  ... %d similar lines collapsed\n", count
+            count = 0
+        }
+        print
+        prev_sig = sig
+    }
+    END {
+        if (count > 0) {
+            printf "  ... %d similar lines collapsed\n", count
+        }
+    }'
+}
+
+# Remove blank lines and trim
+clean_blanks() {
+    sed '/^[[:space:]]*$/d'
+}
+
+# Full cleaning pipeline
+clean_output() {
+    if [[ "$RAW" == "true" ]]; then
+        cat
+    else
+        strip_ansi | shorten_paths | truncate_lines | clean_blanks | collapse_repeats
+    fi
+}
+
+# ── Read output with all filters applied ──
+
+read_output() {
+    local file="$1"
+    local cursor_file="$TASK_DIR/.cursor_$(basename "$file")"
+
+    if [[ ! -f "$file" ]]; then
+        echo ""
+        return
+    fi
+
+    local total_lines
+    total_lines=$(wc -l < "$file" 2>/dev/null | tr -d ' ')
+
+    # Step 1: Get the right slice of the file
+    local content=""
+    if [[ "$SINCE" == "true" ]]; then
+        local last_line=0
+        if [[ -f "$cursor_file" ]]; then
+            last_line=$(cat "$cursor_file" 2>/dev/null || echo "0")
+        fi
+
+        if [[ "$total_lines" -gt "$last_line" ]]; then
+            local skip=$((last_line + 1))
+            content=$(tail -n +"$skip" "$file" 2>/dev/null || echo "")
+            echo "$total_lines" > "$cursor_file"
+        else
+            echo ""
+            return
+        fi
+    elif [[ -n "$TAIL" ]]; then
+        content=$(tail -n "$TAIL" "$file" 2>/dev/null || echo "")
+    else
+        content=$(cat "$file" 2>/dev/null || echo "")
+    fi
+
+    # Step 2: Clean output (strip ANSI, truncate, collapse)
+    if [[ -n "$content" ]]; then
+        content=$(echo "$content" | clean_output)
+    fi
+
+    # Step 3: Exclude noisy lines
+    if [[ -n "$EXCLUDE" && -n "$content" ]]; then
+        content=$(echo "$content" | grep -vE "$EXCLUDE" 2>/dev/null || echo "")
+    fi
+
+    # Step 4: Filter to matching lines only
+    if [[ -n "$FILTER" && -n "$content" ]]; then
+        content=$(echo "$content" | grep -iE "$FILTER" 2>/dev/null || echo "")
+    fi
+
+    # Step 5: Cap output
+    if [[ -n "$content" ]]; then
+        local line_count
+        line_count=$(echo "$content" | wc -l | tr -d ' ')
+        if [[ "$line_count" -gt "$MAX_LINES" ]]; then
+            local skipped=$((line_count - MAX_LINES))
+            content=$(echo "$content" | tail -n "$MAX_LINES")
+            content="[... $skipped earlier lines omitted, showing last $MAX_LINES ...]\n$content"
+        fi
+    fi
+
+    echo "$content"
+}
+
+# Build metadata
+build_meta() {
+    local file="$1"
+    local total=0
+    local cursor_file="$TASK_DIR/.cursor_$(basename "$file")"
+    local last_read=0
+
+    if [[ -f "$file" ]]; then
+        total=$(wc -l < "$file" 2>/dev/null | tr -d ' ')
+    fi
+    if [[ -f "$cursor_file" ]]; then
+        last_read=$(cat "$cursor_file" 2>/dev/null || echo "0")
+    fi
+
+    echo "{\"total_lines\": $total, \"cursor\": $last_read}"
+}
+
+RESULT="{}"
+
+case "$STREAM" in
+    stdout)
+        STDOUT_CONTENT=$(read_output "$TASK_DIR/stdout")
+        STDOUT_META=$(build_meta "$TASK_DIR/stdout")
+        RESULT=$(jq -n \
+            --arg id "$TASK_ID" \
+            --arg status "$STATUS" \
+            --arg stdout "$STDOUT_CONTENT" \
+            --argjson meta "$STDOUT_META" \
+            '{task_id: $id, status: $status, stdout: $stdout, stdout_meta: $meta}')
+        ;;
+    stderr)
+        STDERR_CONTENT=$(read_output "$TASK_DIR/stderr")
+        STDERR_META=$(build_meta "$TASK_DIR/stderr")
+        RESULT=$(jq -n \
+            --arg id "$TASK_ID" \
+            --arg status "$STATUS" \
+            --arg stderr "$STDERR_CONTENT" \
+            --argjson meta "$STDERR_META" \
+            '{task_id: $id, status: $status, stderr: $stderr, stderr_meta: $meta}')
+        ;;
+    both|*)
+        STDOUT_CONTENT=$(read_output "$TASK_DIR/stdout")
+        STDERR_CONTENT=$(read_output "$TASK_DIR/stderr")
+        STDOUT_META=$(build_meta "$TASK_DIR/stdout")
+        STDERR_META=$(build_meta "$TASK_DIR/stderr")
+        RESULT=$(jq -n \
+            --arg id "$TASK_ID" \
+            --arg status "$STATUS" \
+            --arg stdout "$STDOUT_CONTENT" \
+            --arg stderr "$STDERR_CONTENT" \
+            --argjson stdout_meta "$STDOUT_META" \
+            --argjson stderr_meta "$STDERR_META" \
+            '{task_id: $id, status: $status, stdout: $stdout, stderr: $stderr, stdout_meta: $stdout_meta, stderr_meta: $stderr_meta}')
+        ;;
+esac
+
+echo "$RESULT"

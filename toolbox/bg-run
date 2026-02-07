@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# bg-run - Run a command in the background and return a task ID
+# Toolbox tool for Amp - mimics Claude Code's run_in_background feature
+
+set -euo pipefail
+
+TASKS_DIR="${HOME}/.local/state/amp-bg-tasks"
+
+if [[ "${TOOLBOX_ACTION:-}" == "describe" ]]; then
+    cat <<'SCHEMA'
+{
+  "name": "bg_run",
+  "description": "Run a shell command in the background. Returns a task ID you can use with bg_status, bg_output, and bg_stop to monitor and manage the process. Use this for long-running operations like tests, builds, dev servers, or any command you want to run while continuing other work.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "command": {
+        "type": "string",
+        "description": "The shell command to execute in the background"
+      },
+      "label": {
+        "type": "string",
+        "description": "Optional short label for this task (e.g. 'tests', 'dev-server')"
+      },
+      "cwd": {
+        "type": "string",
+        "description": "Optional working directory for the command. Defaults to current directory."
+      }
+    },
+    "required": ["command"]
+  }
+}
+SCHEMA
+    exit 0
+fi
+
+# Execute mode
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | jq -r '.command // empty')
+LABEL=$(echo "$INPUT" | jq -r '.label // empty')
+CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+
+if [[ -z "$COMMAND" ]]; then
+    echo '{"error": "command is required"}'
+    exit 1
+fi
+
+# Generate task ID
+TASK_ID="task-$(date +%s)-$$"
+TASK_DIR="${TASKS_DIR}/${TASK_ID}"
+mkdir -p "$TASK_DIR"
+
+# Store metadata
+echo "$COMMAND" > "$TASK_DIR/command"
+echo "${LABEL:-$TASK_ID}" > "$TASK_DIR/label"
+date -u +"%Y-%m-%dT%H:%M:%SZ" > "$TASK_DIR/started_at"
+echo "running" > "$TASK_DIR/status"
+
+# Resolve working directory
+WORK_DIR="${CWD:-$(pwd)}"
+echo "$WORK_DIR" > "$TASK_DIR/cwd"
+
+# Run command in background with output capture
+(
+    cd "$WORK_DIR" 2>/dev/null || true
+    eval "$COMMAND" > "$TASK_DIR/stdout" 2> "$TASK_DIR/stderr"
+    EXIT_CODE=$?
+    echo "$EXIT_CODE" > "$TASK_DIR/exit_code"
+    if [[ $EXIT_CODE -eq 0 ]]; then
+        echo "completed" > "$TASK_DIR/status"
+    else
+        echo "failed" > "$TASK_DIR/status"
+    fi
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$TASK_DIR/finished_at"
+) &
+
+BG_PID=$!
+echo "$BG_PID" > "$TASK_DIR/pid"
+
+# Return task info
+jq -n \
+    --arg id "$TASK_ID" \
+    --arg pid "$BG_PID" \
+    --arg command "$COMMAND" \
+    --arg label "${LABEL:-$TASK_ID}" \
+    --arg cwd "$WORK_DIR" \
+    '{
+        task_id: $id,
+        pid: ($pid | tonumber),
+        command: $command,
+        label: $label,
+        cwd: $cwd,
+        status: "running",
+        message: "Task started in background. Use bg_status or bg_output to check progress."
+    }'

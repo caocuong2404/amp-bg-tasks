@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# bg-stop - Stop a background task or clean up finished tasks
+# Toolbox tool for Amp
+
+set -euo pipefail
+
+TASKS_DIR="${HOME}/.local/state/amp-bg-tasks"
+
+if [[ "${TOOLBOX_ACTION:-}" == "describe" ]]; then
+    cat <<'SCHEMA'
+{
+  "name": "bg_stop",
+  "description": "Stop a running background task by killing its process, or clean up finished tasks. Use action 'kill' to stop a running task, or 'cleanup' to remove all completed/failed task records.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "task_id": {
+        "type": "string",
+        "description": "The task ID to stop. Required for 'kill' action."
+      },
+      "action": {
+        "type": "string",
+        "enum": ["kill", "cleanup"],
+        "description": "Action to perform. 'kill' stops a running task. 'cleanup' removes finished task records. Default: kill"
+      }
+    }
+  }
+}
+SCHEMA
+    exit 0
+fi
+
+# Execute mode
+INPUT=$(cat)
+TASK_ID=$(echo "$INPUT" | jq -r '.task_id // empty')
+ACTION=$(echo "$INPUT" | jq -r '.action // "kill"')
+
+case "$ACTION" in
+    cleanup)
+        CLEANED=0
+        if [[ -d "$TASKS_DIR" ]]; then
+            for task_dir in "$TASKS_DIR"/task-*; do
+                [[ -d "$task_dir" ]] || continue
+                local_status=$(cat "$task_dir/status" 2>/dev/null || echo "unknown")
+                if [[ "$local_status" != "running" ]]; then
+                    rm -rf "$task_dir"
+                    CLEANED=$((CLEANED + 1))
+                fi
+            done
+        fi
+        jq -n --argjson cleaned "$CLEANED" \
+            '{action: "cleanup", cleaned: $cleaned, message: "Removed \($cleaned) finished task(s)."}'
+        ;;
+
+    kill|*)
+        if [[ -z "$TASK_ID" ]]; then
+            echo '{"error": "task_id is required for kill action"}'
+            exit 1
+        fi
+
+        TASK_DIR="${TASKS_DIR}/${TASK_ID}"
+        if [[ ! -d "$TASK_DIR" ]]; then
+            echo "{\"error\": \"Task not found: $TASK_ID\"}"
+            exit 1
+        fi
+
+        STATUS=$(cat "$TASK_DIR/status" 2>/dev/null || echo "unknown")
+        if [[ "$STATUS" != "running" ]]; then
+            jq -n --arg id "$TASK_ID" --arg status "$STATUS" \
+                '{task_id: $id, message: "Task is not running (status: \($status))"}'
+            exit 0
+        fi
+
+        PID=$(cat "$TASK_DIR/pid" 2>/dev/null || echo "0")
+
+        if [[ "$PID" != "0" ]] && kill -0 "$PID" 2>/dev/null; then
+            # Kill the process group to catch child processes
+            kill -- -"$PID" 2>/dev/null || kill "$PID" 2>/dev/null || true
+            sleep 0.5
+            # Force kill if still alive
+            if kill -0 "$PID" 2>/dev/null; then
+                kill -9 "$PID" 2>/dev/null || true
+            fi
+        fi
+
+        echo "killed" > "$TASK_DIR/status"
+        echo "137" > "$TASK_DIR/exit_code"
+        date -u +"%Y-%m-%dT%H:%M:%SZ" > "$TASK_DIR/finished_at"
+
+        jq -n --arg id "$TASK_ID" --arg pid "$PID" \
+            '{task_id: $id, pid: ($pid | tonumber), status: "killed", message: "Task stopped."}'
+        ;;
+esac
