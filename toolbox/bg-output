@@ -11,7 +11,7 @@ if [[ "${TOOLBOX_ACTION:-}" == "describe" ]]; then
     cat <<'SCHEMA'
 {
   "name": "bg_output",
-  "description": "Smart log reader for background tasks. Output is ALWAYS auto-cleaned: ANSI codes stripped, long lines truncated to 150 chars, repetitive lines collapsed (e.g. '... 8 similar lines collapsed'). Use 'filter' to grep only errors/warnings, 'exclude' to hide noise, 'since' for incremental reads (only new lines since last check), 'tail' for last N lines. Default max_lines=80. IMPORTANT: For dev servers, ALWAYS use filter='error|Error|ERROR|warn|WARN|fail|FAIL|exception|Exception|panic|crash' to avoid context pollution.",
+  "description": "Smart log reader for background tasks. INCREMENTAL BY DEFAULT: only returns NEW lines since last read (cursor-tracked). First read returns last max_lines lines (not everything). Output is auto-cleaned: ANSI stripped, long lines truncated, repeats collapsed. Use 'filter' to grep only errors/warnings, 'exclude' to hide noise. Set since=false to read all output from start. IMPORTANT: For dev servers, ALWAYS use filter='error|Error|ERROR|warn|WARN|fail|FAIL|exception|Exception|panic|crash' to avoid context pollution.",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -38,7 +38,7 @@ if [[ "${TOOLBOX_ACTION:-}" == "describe" ]]; then
       },
       "since": {
         "type": "boolean",
-        "description": "Incremental mode — only new lines since last read. Tracks cursor per task. Use for polling running servers."
+        "description": "Incremental mode — DEFAULT TRUE. Only new lines since last read. First read returns last max_lines lines (not all). Set false to read full output from start."
       },
       "max_lines": {
         "type": "integer",
@@ -63,7 +63,7 @@ STREAM=$(echo "$INPUT" | jq -r '.stream // "both"')
 TAIL=$(echo "$INPUT" | jq -r '.tail // empty')
 FILTER=$(echo "$INPUT" | jq -r '.filter // empty')
 EXCLUDE=$(echo "$INPUT" | jq -r '.exclude // empty')
-SINCE=$(echo "$INPUT" | jq -r '.since // false')
+SINCE=$(echo "$INPUT" | jq -r '.since // true')
 MAX_LINES=$(echo "$INPUT" | jq -r '.max_lines // "80"')
 RAW=$(echo "$INPUT" | jq -r '.raw // false')
 
@@ -175,13 +175,25 @@ read_output() {
     local content=""
     if [[ "$SINCE" == "true" ]]; then
         local last_line=0
+        local first_read=false
         if [[ -f "$cursor_file" ]]; then
             last_line=$(cat "$cursor_file" 2>/dev/null || echo "0")
+        else
+            first_read=true
         fi
 
         if [[ "$total_lines" -gt "$last_line" ]]; then
-            local skip=$((last_line + 1))
-            content=$(tail -n +"$skip" "$file" 2>/dev/null || echo "")
+            if [[ "$first_read" == "true" ]]; then
+                # First read ever: use tail to get last N lines (not all from start)
+                # This prevents dumping 10,000 boot lines on first check
+                local tail_n="${TAIL:-$MAX_LINES}"
+                content=$(tail -n "$tail_n" "$file" 2>/dev/null || echo "")
+            else
+                # Subsequent reads: only new lines since cursor
+                local skip=$((last_line + 1))
+                content=$(tail -n +"$skip" "$file" 2>/dev/null || echo "")
+            fi
+            # Always advance cursor to end
             echo "$total_lines" > "$cursor_file"
         else
             echo ""
