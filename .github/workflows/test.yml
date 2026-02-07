@@ -1,0 +1,56 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats-core
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update && sudo apt-get install -y bats
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install bats-core
+          fi
+
+      - name: Install jq
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get install -y jq
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install jq || true  # usually pre-installed
+          fi
+
+      - name: Make scripts executable
+        run: chmod +x toolbox/* bg-reaper install.sh
+
+      - name: Run tests
+        run: bats test/ --formatter tap
+
+      - name: Test install script (dry run structure)
+        run: |
+          # Verify install script runs without error
+          mkdir -p ~/.config/agents/toolbox
+          mkdir -p ~/.config/agents/skills
+          mkdir -p ~/.local/bin
+          mkdir -p ~/.local/state/amp-bg-tasks
+          ./install.sh
+          # Verify files were installed
+          test -x ~/.config/agents/toolbox/bg-run
+          test -x ~/.config/agents/toolbox/bg-output
+          test -x ~/.config/agents/toolbox/bg-status
+          test -x ~/.config/agents/toolbox/bg-stop
+          test -f ~/.config/agents/skills/background-tasks/SKILL.md
+          test -f ~/.config/agents/AGENTS.md
+          test -x ~/.local/bin/bg-reaper

@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-TASKS_DIR="${HOME}/.local/state/amp-bg-tasks"
+TASKS_DIR="${TASKS_DIR:-${HOME}/.local/state/amp-bg-tasks}"
 
 if [[ "${TOOLBOX_ACTION:-}" == "describe" ]]; then
     cat <<'SCHEMA'
@@ -70,8 +70,10 @@ echo "$WORK_DIR" > "$TASK_DIR/cwd"
 # Run command in background with output capture
 (
     cd "$WORK_DIR" 2>/dev/null || true
-    eval "$COMMAND" > "$TASK_DIR/stdout" 2> "$TASK_DIR/stderr"
+    set +e
+    bash -c "$COMMAND" > "$TASK_DIR/stdout" 2> "$TASK_DIR/stderr"
     EXIT_CODE=$?
+    set -e
     echo "$EXIT_CODE" > "$TASK_DIR/exit_code"
     if [[ $EXIT_CODE -eq 0 ]]; then
         echo "completed" > "$TASK_DIR/status"
@@ -79,7 +81,7 @@ echo "$WORK_DIR" > "$TASK_DIR/cwd"
         echo "failed" > "$TASK_DIR/status"
     fi
     date -u +"%Y-%m-%dT%H:%M:%SZ" > "$TASK_DIR/finished_at"
-) &
+) </dev/null >/dev/null 2>/dev/null &
 
 BG_PID=$!
 echo "$BG_PID" > "$TASK_DIR/pid"
@@ -98,14 +100,14 @@ if [[ "$TIMEOUT" -gt 0 ]] 2>/dev/null; then
             echo "143" > "$TASK_DIR/exit_code"
             date -u +"%Y-%m-%dT%H:%M:%SZ" > "$TASK_DIR/finished_at"
         fi
-    ) &
+    ) </dev/null >/dev/null 2>/dev/null &
     WATCHDOG_PID=$!
     echo "$WATCHDOG_PID" > "$TASK_DIR/watchdog_pid"
     # Ensure watchdog dies if main process finishes early
     (
         while kill -0 "$BG_PID" 2>/dev/null; do sleep 5; done
         kill "$WATCHDOG_PID" 2>/dev/null || true
-    ) &
+    ) </dev/null >/dev/null 2>/dev/null &
 fi
 
 # Build response

@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-TASKS_DIR="${HOME}/.local/state/amp-bg-tasks"
+TASKS_DIR="${TASKS_DIR:-${HOME}/.local/state/amp-bg-tasks}"
 NOW=$(date +%s)
 
 if [[ "${TOOLBOX_ACTION:-}" == "describe" ]]; then
