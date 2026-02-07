@@ -10,7 +10,7 @@ Inspired by [Claude Code's](https://claude.com/claude-code) `run_in_background` 
 
 When debugging a monorepo, you need to run backend + frontend dev servers simultaneously. But if the agent reads raw server logs, thousands of noisy lines flood the context window — HMR updates, health checks, static asset requests, ANSI color codes, 300-character `node_modules/.pnpm/` paths.
 
-**amp-bg-tasks** solves this with 4 toolbox tools that give your agent surgical control over background processes and their output.
+**amp-bg-tasks** solves this with 4 toolbox tools that give your agent surgical control over background processes and their output. Tasks **auto-kill after 2 hours** by default, so you'll never have zombie dev servers running overnight.
 
 ## Tools
 
@@ -74,12 +74,22 @@ cp skill/SKILL.md ~/.config/agents/skills/background-tasks/
 cat agents/AGENTS.md >> ~/.config/agents/AGENTS.md
 ```
 
-4. Set the toolbox path (add to your shell profile):
+4. Install the reaper (auto-kills stale tasks on shell open):
 ```bash
-export AMP_TOOLBOX="$HOME/.config/agents/toolbox"
+mkdir -p ~/.local/bin
+cp bg-reaper ~/.local/bin/
+chmod +x ~/.local/bin/bg-reaper
 ```
 
-5. Restart Amp.
+5. Add to your shell profile (`~/.zshrc` or `~/.bashrc`):
+```bash
+# amp-bg-tasks
+export AMP_TOOLBOX="$HOME/.config/agents/toolbox"
+export PATH="$HOME/.local/bin:$PATH"
+bg-reaper --max-age 180 2>/dev/null  # auto-kill stale tasks on shell open
+```
+
+6. Restart your shell and Amp.
 
 ## Usage
 
@@ -128,6 +138,46 @@ bg_run command="tail -f /var/log/app.log" label="logs"
 bg_output task_id="task-xxx" since=true   # only new lines
 # ... trigger another ...
 bg_output task_id="task-xxx" since=true   # only newer lines
+```
+
+## Auto-Kill & Cleanup
+
+No more zombie dev servers running overnight after you close your laptop.
+
+### 3 layers of protection:
+
+| Layer | What | When |
+|-------|------|------|
+| **Watchdog** (built into `bg_run`) | Each task auto-kills after `timeout` minutes | Default: 120m (2 hours). Set `timeout=0` to disable. |
+| **Reaper** (`bg-reaper`) | Kills stale tasks + cleans old records on shell startup | Every time you open a terminal |
+| **Status warnings** (`bg_status`) | Shows `age` and `auto_kill` countdown per task | Agent sees "EXPIRING in 5m" or "OVERDUE" |
+
+### Timeout examples:
+
+```
+# Default: auto-kill after 2 hours
+bg_run command="pnpm dev" label="dev-server"
+
+# Long build: give it 4 hours
+bg_run command="make build-all" label="build" timeout=240
+
+# Quick test: kill after 10 minutes
+bg_run command="npm test" label="tests" timeout=10
+
+# Intentionally permanent: disable auto-kill
+bg_run command="tail -f /var/log/syslog" label="syslog" timeout=0
+```
+
+### Reaper usage:
+
+```bash
+# Run manually
+bg-reaper                     # kill tasks >3h old (default)
+bg-reaper --max-age 60        # kill tasks >1h old
+bg-reaper --dry-run            # preview what would be killed
+
+# Auto-run on shell startup (add to ~/.zshrc)
+bg-reaper --max-age 180 2>/dev/null
 ```
 
 ## Common Exclude Patterns

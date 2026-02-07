@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # bg-status - Check status of background tasks
+# Shows age + timeout warnings for stale tasks
 # Toolbox tool for Amp
 
 set -euo pipefail
 
 TASKS_DIR="${HOME}/.local/state/amp-bg-tasks"
+NOW=$(date +%s)
 
 if [[ "${TOOLBOX_ACTION:-}" == "describe" ]]; then
     cat <<'SCHEMA'
 {
   "name": "bg_status",
-  "description": "Check the status of background tasks. Without a task_id, lists all tasks. With a task_id, shows detailed status of that specific task. Use this to monitor running processes started with bg_run.",
+  "description": "Check the status of background tasks. Without a task_id, lists all tasks with age and timeout info. With a task_id, shows detailed status. Running tasks show how long they've been running and when they'll auto-kill.",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -38,7 +40,6 @@ refresh_task() {
         local pid
         pid=$(cat "$task_dir/pid" 2>/dev/null || echo "0")
         if [[ "$pid" != "0" ]] && ! kill -0 "$pid" 2>/dev/null; then
-            # Process ended but status wasn't updated (e.g. killed externally)
             if [[ -f "$task_dir/exit_code" ]]; then
                 local ec
                 ec=$(cat "$task_dir/exit_code")
@@ -56,8 +57,44 @@ refresh_task() {
     fi
 }
 
+# Calculate age from task ID
+get_age_info() {
+    local task_id="$1"
+    local task_dir="$2"
+    local started_epoch
+    started_epoch=$(echo "$task_id" | sed -E 's/task-([0-9]+)-.*/\1/' 2>/dev/null || echo "0")
+    local age_secs=$((NOW - started_epoch))
+    local age_min=$((age_secs / 60))
+    local timeout_min
+    timeout_min=$(cat "$task_dir/timeout" 2>/dev/null || echo "120")
+
+    local age_str=""
+    if [[ "$age_min" -lt 60 ]]; then
+        age_str="${age_min}m"
+    else
+        local hours=$((age_min / 60))
+        local mins=$((age_min % 60))
+        age_str="${hours}h${mins}m"
+    fi
+
+    local remaining=""
+    if [[ "$timeout_min" -gt 0 ]] 2>/dev/null; then
+        local remaining_min=$((timeout_min - age_min))
+        if [[ "$remaining_min" -le 0 ]]; then
+            remaining="OVERDUE"
+        elif [[ "$remaining_min" -lt 10 ]]; then
+            remaining="EXPIRING in ${remaining_min}m"
+        else
+            remaining="${remaining_min}m left"
+        fi
+    else
+        remaining="no timeout"
+    fi
+
+    echo "$age_str|$remaining|$timeout_min"
+}
+
 if [[ -n "$TASK_ID" ]]; then
-    # Show specific task
     TASK_DIR="${TASKS_DIR}/${TASK_ID}"
     if [[ ! -d "$TASK_DIR" ]]; then
         echo "{\"error\": \"Task not found: $TASK_ID\"}"
@@ -74,8 +111,13 @@ if [[ -n "$TASK_ID" ]]; then
     FINISHED=$(cat "$TASK_DIR/finished_at" 2>/dev/null || echo "")
     EXIT_CODE=$(cat "$TASK_DIR/exit_code" 2>/dev/null || echo "")
     CWD=$(cat "$TASK_DIR/cwd" 2>/dev/null || echo "")
-    STDOUT_LINES=$(wc -l < "$TASK_DIR/stdout" 2>/dev/null || echo "0")
-    STDERR_LINES=$(wc -l < "$TASK_DIR/stderr" 2>/dev/null || echo "0")
+    STDOUT_LINES=$(wc -l < "$TASK_DIR/stdout" 2>/dev/null | tr -d ' ' || echo "0")
+    STDERR_LINES=$(wc -l < "$TASK_DIR/stderr" 2>/dev/null | tr -d ' ' || echo "0")
+
+    AGE_INFO=$(get_age_info "$TASK_ID" "$TASK_DIR")
+    AGE_STR=$(echo "$AGE_INFO" | cut -d'|' -f1)
+    REMAINING=$(echo "$AGE_INFO" | cut -d'|' -f2)
+    TIMEOUT_MIN=$(echo "$AGE_INFO" | cut -d'|' -f3)
 
     jq -n \
         --arg id "$TASK_ID" \
@@ -89,6 +131,9 @@ if [[ -n "$TASK_ID" ]]; then
         --arg cwd "$CWD" \
         --arg stdout_lines "$STDOUT_LINES" \
         --arg stderr_lines "$STDERR_LINES" \
+        --arg age "$AGE_STR" \
+        --arg remaining "$REMAINING" \
+        --arg timeout "$TIMEOUT_MIN" \
         '{
             task_id: $id,
             status: $status,
@@ -97,13 +142,15 @@ if [[ -n "$TASK_ID" ]]; then
             pid: ($pid | tonumber),
             cwd: $cwd,
             started_at: $started,
+            age: $age,
+            timeout_minutes: (if $timeout != "" then ($timeout | tonumber) else null end),
+            auto_kill: $remaining,
             finished_at: (if $finished != "" then $finished else null end),
             exit_code: (if $exit_code != "" then ($exit_code | tonumber) else null end),
             stdout_lines: ($stdout_lines | tonumber),
             stderr_lines: ($stderr_lines | tonumber)
         }'
 else
-    # List all tasks
     if [[ ! -d "$TASKS_DIR" ]]; then
         echo '{"tasks": [], "message": "No background tasks found."}'
         exit 0
@@ -121,6 +168,10 @@ else
         local_started=$(cat "$task_dir/started_at" 2>/dev/null || echo "")
         local_pid=$(cat "$task_dir/pid" 2>/dev/null || echo "0")
 
+        AGE_INFO=$(get_age_info "$local_id" "$task_dir")
+        local_age=$(echo "$AGE_INFO" | cut -d'|' -f1)
+        local_remaining=$(echo "$AGE_INFO" | cut -d'|' -f2)
+
         TASKS=$(echo "$TASKS" | jq \
             --arg id "$local_id" \
             --arg status "$local_status" \
@@ -128,13 +179,17 @@ else
             --arg command "$local_command" \
             --arg started "$local_started" \
             --arg pid "$local_pid" \
+            --arg age "$local_age" \
+            --arg remaining "$local_remaining" \
             '. + [{
                 task_id: $id,
                 status: $status,
                 label: $label,
                 command: $command,
                 started_at: $started,
-                pid: ($pid | tonumber)
+                pid: ($pid | tonumber),
+                age: $age,
+                auto_kill: $remaining
             }]')
     done
 

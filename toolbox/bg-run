@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # bg-run - Run a command in the background and return a task ID
 # Toolbox tool for Amp - mimics Claude Code's run_in_background feature
+# Auto-kills after timeout (default 2h) to prevent zombie processes
 
 set -euo pipefail
 
@@ -10,7 +11,7 @@ if [[ "${TOOLBOX_ACTION:-}" == "describe" ]]; then
     cat <<'SCHEMA'
 {
   "name": "bg_run",
-  "description": "Run a shell command in the background. Returns a task ID you can use with bg_status, bg_output, and bg_stop to monitor and manage the process. Use this for long-running operations like tests, builds, dev servers, or any command you want to run while continuing other work.",
+  "description": "Run a shell command in the background. Returns a task ID you can use with bg_status, bg_output, and bg_stop to monitor and manage the process. Tasks auto-kill after timeout (default 2 hours) to prevent zombie processes if the user closes Amp or forgets. Use timeout=0 to disable auto-kill for intentionally long-running tasks.",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -25,6 +26,10 @@ if [[ "${TOOLBOX_ACTION:-}" == "describe" ]]; then
       "cwd": {
         "type": "string",
         "description": "Optional working directory for the command. Defaults to current directory."
+      },
+      "timeout": {
+        "type": "integer",
+        "description": "Auto-kill after N minutes. Default: 120 (2 hours). Set 0 to disable. Prevents zombie processes if you close Amp or forget."
       }
     },
     "required": ["command"]
@@ -39,6 +44,7 @@ INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.command // empty')
 LABEL=$(echo "$INPUT" | jq -r '.label // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+TIMEOUT=$(echo "$INPUT" | jq -r '.timeout // "120"')
 
 if [[ -z "$COMMAND" ]]; then
     echo '{"error": "command is required"}'
@@ -55,6 +61,7 @@ echo "$COMMAND" > "$TASK_DIR/command"
 echo "${LABEL:-$TASK_ID}" > "$TASK_DIR/label"
 date -u +"%Y-%m-%dT%H:%M:%SZ" > "$TASK_DIR/started_at"
 echo "running" > "$TASK_DIR/status"
+echo "$TIMEOUT" > "$TASK_DIR/timeout"
 
 # Resolve working directory
 WORK_DIR="${CWD:-$(pwd)}"
@@ -77,19 +84,53 @@ echo "$WORK_DIR" > "$TASK_DIR/cwd"
 BG_PID=$!
 echo "$BG_PID" > "$TASK_DIR/pid"
 
-# Return task info
+# Spawn watchdog to auto-kill after timeout
+if [[ "$TIMEOUT" -gt 0 ]] 2>/dev/null; then
+    TIMEOUT_SECS=$((TIMEOUT * 60))
+    (
+        sleep "$TIMEOUT_SECS" 2>/dev/null
+        # Check if still running
+        if kill -0 "$BG_PID" 2>/dev/null; then
+            kill -- -"$BG_PID" 2>/dev/null || kill "$BG_PID" 2>/dev/null || true
+            sleep 1
+            kill -9 "$BG_PID" 2>/dev/null || true
+            echo "timeout" > "$TASK_DIR/status"
+            echo "143" > "$TASK_DIR/exit_code"
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > "$TASK_DIR/finished_at"
+        fi
+    ) &
+    WATCHDOG_PID=$!
+    echo "$WATCHDOG_PID" > "$TASK_DIR/watchdog_pid"
+    # Ensure watchdog dies if main process finishes early
+    (
+        while kill -0 "$BG_PID" 2>/dev/null; do sleep 5; done
+        kill "$WATCHDOG_PID" 2>/dev/null || true
+    ) &
+fi
+
+# Build response
+TIMEOUT_MSG=""
+if [[ "$TIMEOUT" -gt 0 ]] 2>/dev/null; then
+    TIMEOUT_MSG="Auto-kills in ${TIMEOUT}m."
+else
+    TIMEOUT_MSG="No auto-kill (timeout disabled)."
+fi
+
 jq -n \
     --arg id "$TASK_ID" \
     --arg pid "$BG_PID" \
     --arg command "$COMMAND" \
     --arg label "${LABEL:-$TASK_ID}" \
     --arg cwd "$WORK_DIR" \
+    --arg timeout "$TIMEOUT" \
+    --arg timeout_msg "$TIMEOUT_MSG" \
     '{
         task_id: $id,
         pid: ($pid | tonumber),
         command: $command,
         label: $label,
         cwd: $cwd,
+        timeout_minutes: ($timeout | tonumber),
         status: "running",
-        message: "Task started in background. Use bg_status or bg_output to check progress."
+        message: ("Task started in background. " + $timeout_msg + " Use bg_status or bg_output to check progress.")
     }'

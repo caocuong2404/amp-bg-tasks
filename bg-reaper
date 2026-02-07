@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# bg-reaper — Kill stale background tasks from previous sessions
+# Add to ~/.zshrc or ~/.bashrc: eval "$(~/path/to/bg-reaper)"
+# Or run manually: bg-reaper [--max-age MINUTES] [--dry-run]
+#
+# Kills any bg-task that:
+#   1. Is still marked "running" but the process is dead (zombie cleanup)
+#   2. Has been running longer than --max-age (default: 180 minutes / 3 hours)
+#
+# Safe to run repeatedly — only kills genuinely stale tasks.
+
+set -euo pipefail
+
+TASKS_DIR="${HOME}/.local/state/amp-bg-tasks"
+MAX_AGE_MINUTES=180
+DRY_RUN=false
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --max-age) MAX_AGE_MINUTES="$2"; shift 2 ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        --help|-h)
+            echo "Usage: bg-reaper [--max-age MINUTES] [--dry-run]"
+            echo ""
+            echo "Kills stale background tasks started by amp-bg-tasks toolbox."
+            echo ""
+            echo "Options:"
+            echo "  --max-age MINUTES  Kill tasks older than N minutes (default: 180)"
+            echo "  --dry-run          Show what would be killed without doing it"
+            echo ""
+            echo "Shell integration (add to ~/.zshrc):"
+            echo "  bg-reaper --max-age 180 2>/dev/null"
+            exit 0
+            ;;
+        *) shift ;;
+    esac
+done
+
+if [[ ! -d "$TASKS_DIR" ]]; then
+    exit 0
+fi
+
+NOW=$(date +%s)
+MAX_AGE_SECS=$((MAX_AGE_MINUTES * 60))
+KILLED=0
+CLEANED=0
+
+for task_dir in "$TASKS_DIR"/task-*; do
+    [[ -d "$task_dir" ]] || continue
+
+    task_id=$(basename "$task_dir")
+    status=$(cat "$task_dir/status" 2>/dev/null || echo "unknown")
+    pid=$(cat "$task_dir/pid" 2>/dev/null || echo "0")
+    label=$(cat "$task_dir/label" 2>/dev/null || echo "$task_id")
+
+    # Extract start time from task ID (task-EPOCH-PID)
+    started_epoch=$(echo "$task_id" | sed -E 's/task-([0-9]+)-.*/\1/' 2>/dev/null || echo "0")
+    age_secs=$((NOW - started_epoch))
+    age_min=$((age_secs / 60))
+
+    if [[ "$status" == "running" ]]; then
+        should_kill=false
+        reason=""
+
+        # Case 1: Process is dead but status says running (zombie)
+        if [[ "$pid" != "0" ]] && ! kill -0 "$pid" 2>/dev/null; then
+            should_kill=true
+            reason="process dead (zombie)"
+        fi
+
+        # Case 2: Running longer than max age
+        if [[ "$age_secs" -gt "$MAX_AGE_SECS" ]]; then
+            should_kill=true
+            reason="stale (${age_min}m old, max ${MAX_AGE_MINUTES}m)"
+        fi
+
+        if [[ "$should_kill" == "true" ]]; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+                echo "[dry-run] Would kill: $label (pid=$pid, $reason)"
+            else
+                # Kill the process if still alive
+                if [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null; then
+                    kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+                    sleep 0.5
+                    kill -9 "$pid" 2>/dev/null || true
+                fi
+                # Kill watchdog if present
+                watchdog_pid=$(cat "$task_dir/watchdog_pid" 2>/dev/null || echo "0")
+                if [[ "$watchdog_pid" != "0" ]]; then
+                    kill "$watchdog_pid" 2>/dev/null || true
+                fi
+                # Update status
+                echo "reaped" > "$task_dir/status"
+                echo "143" > "$task_dir/exit_code"
+                date -u +"%Y-%m-%dT%H:%M:%SZ" > "$task_dir/finished_at"
+                echo "[bg-reaper] Killed: $label (pid=$pid, $reason)"
+                KILLED=$((KILLED + 1))
+            fi
+        fi
+    else
+        # Clean up finished tasks older than max age
+        if [[ "$age_secs" -gt "$MAX_AGE_SECS" ]]; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+                echo "[dry-run] Would clean: $label (status=$status, ${age_min}m old)"
+            else
+                rm -rf "$task_dir"
+                CLEANED=$((CLEANED + 1))
+            fi
+        fi
+    fi
+done
+
+if [[ "$KILLED" -gt 0 || "$CLEANED" -gt 0 ]]; then
+    echo "[bg-reaper] Killed $KILLED stale task(s), cleaned $CLEANED old record(s)"
+fi
