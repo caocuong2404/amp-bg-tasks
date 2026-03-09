@@ -89,9 +89,25 @@ echo "$BG_PID" > "$TASK_DIR/pid"
 # Spawn watchdog to auto-kill after timeout
 if [[ "$TIMEOUT" -gt 0 ]] 2>/dev/null; then
     TIMEOUT_SECS=$((TIMEOUT * 60))
-    (
-        sleep "$TIMEOUT_SECS" 2>/dev/null
-        # Check if still running
+    # Use a coprocess-like approach: monitor both timeout and early exit
+    {
+        # Start sleep in background and get its PID
+        sleep "$TIMEOUT_SECS" &
+        SLEEP_PID=$!
+
+        # Monitor: if BG_PID dies, kill the sleep to exit early
+        # If sleep finishes first, BG_PID timed out
+        while kill -0 "$BG_PID" 2>/dev/null && kill -0 "$SLEEP_PID" 2>/dev/null; do
+            sleep 1
+        done
+
+        # If sleep is still running, BG_PID died first (early completion)
+        if kill -0 "$SLEEP_PID" 2>/dev/null; then
+            kill "$SLEEP_PID" 2>/dev/null || true
+            exit 0
+        fi
+
+        # Sleep finished first = timeout
         if kill -0 "$BG_PID" 2>/dev/null; then
             kill -- -"$BG_PID" 2>/dev/null || kill "$BG_PID" 2>/dev/null || true
             sleep 1
@@ -100,14 +116,10 @@ if [[ "$TIMEOUT" -gt 0 ]] 2>/dev/null; then
             echo "143" > "$TASK_DIR/exit_code"
             date -u +"%Y-%m-%dT%H:%M:%SZ" > "$TASK_DIR/finished_at"
         fi
-    ) </dev/null >/dev/null 2>/dev/null &
+    } </dev/null >/dev/null 2>/dev/null &
     WATCHDOG_PID=$!
     echo "$WATCHDOG_PID" > "$TASK_DIR/watchdog_pid"
-    # Ensure watchdog dies if main process finishes early
-    (
-        while kill -0 "$BG_PID" 2>/dev/null; do sleep 5; done
-        kill "$WATCHDOG_PID" 2>/dev/null || true
-    ) </dev/null >/dev/null 2>/dev/null &
+    disown "$WATCHDOG_PID" 2>/dev/null || true
 fi
 
 # Build response

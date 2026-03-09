@@ -16,11 +16,15 @@ teardown() {
             [[ -d "$task_dir" ]] || continue
             pid=$(cat "$task_dir/pid" 2>/dev/null || echo "0")
             if [[ "$pid" != "0" ]]; then
+                # Kill the process and all its children
+                kill -- -"$pid" 2>/dev/null || true
                 kill "$pid" 2>/dev/null || true
+                kill -9 -- -"$pid" 2>/dev/null || true
                 kill -9 "$pid" 2>/dev/null || true
             fi
             watchdog=$(cat "$task_dir/watchdog_pid" 2>/dev/null || echo "0")
             if [[ "$watchdog" != "0" ]]; then
+                kill -- -"$watchdog" 2>/dev/null || true
                 kill "$watchdog" 2>/dev/null || true
             fi
         done
